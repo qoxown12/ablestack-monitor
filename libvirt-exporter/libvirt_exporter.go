@@ -18,6 +18,7 @@
 package main
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"database/sql"
@@ -32,6 +33,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/AlexZzz/libvirt-exporter/libvirtSchema"
 	_ "github.com/go-sql-driver/mysql"
@@ -78,6 +80,8 @@ var domainMetaInfo = map[int]map[string]string{}
 var networkMetaInfo = map[int]map[string]string{}
 var diskMetaInfo = map[int]map[string]string{}
 var password = ""
+var webTimeoutDuration = 10 * time.Second
+var qemuAgentTimeoutDuration = 1 * time.Second
 
 type AESCipher struct {
 	block cipher.Block
@@ -1267,10 +1271,29 @@ func (a *AESCipher) DecryptString(base64String string) string {
 	return decPw
 }
 
-func CollectMoldMeta(ch chan<- prometheus.Metric) {
-	//conf 파일을 파싱하여 json으로 변환
-	json.Unmarshal([]byte(byteValue), &confValue)
+func loadTimeoutFromConfig(conf map[string]interface{}, key string, defaultTimeout time.Duration) time.Duration {
+	raw, ok := conf[key]
+	if !ok {
+		return defaultTimeout
+	}
 
+	switch v := raw.(type) {
+	case float64:
+		if v > 0 {
+			return time.Duration(v * float64(time.Second))
+		}
+	case string:
+		sec, err := strconv.Atoi(strings.TrimSpace(v))
+		if err == nil && sec > 0 {
+			return time.Duration(sec) * time.Second
+		}
+	}
+
+	log.Printf("invalid %s value in conf.json, using default %s", key, defaultTimeout)
+	return defaultTimeout
+}
+
+func CollectMoldMeta(ch chan<- prometheus.Metric) {
 	moldDbConf := confValue["mold_db"].(map[string]interface{})
 	serverhost := moldDbConf["serverhost"].(string)
 	port := moldDbConf["port"].(string)
@@ -1456,8 +1479,11 @@ func CollectMoldMeta(ch chan<- prometheus.Metric) {
 }
 
 func checkFsinfo(domainName string, ch chan<- prometheus.Metric) {
+	ctx, cancel := context.WithTimeout(context.Background(), qemuAgentTimeoutDuration)
+	defer cancel()
+
 	// 실행할 셸 명령과 인자들
-	cmd := exec.Command("virsh", "qemu-agent-command", domainName, "{\"execute\": \"guest-get-fsinfo\"}", "--pretty")
+	cmd := exec.CommandContext(ctx, "virsh", "qemu-agent-command", domainName, "{\"execute\": \"guest-get-fsinfo\"}", "--pretty")
 
 	// 명령 실행 및 결과 처리
 	jsonString, err := cmd.CombinedOutput()
@@ -1578,8 +1604,16 @@ func main() {
 	// defer the closing of our jsonFile so that we can parse it later on
 	defer jsonFile.Close()
 
-	val, _ := ioutil.ReadAll(jsonFile)
+	val, err := ioutil.ReadAll(jsonFile)
+	if err != nil {
+		log.Fatal(err)
+	}
 	byteValue = val
+	if err := json.Unmarshal(byteValue, &confValue); err != nil {
+		log.Fatal(err)
+	}
+	webTimeoutDuration = loadTimeoutFromConfig(confValue, "web_timeout_seconds", 10*time.Second)
+	qemuAgentTimeoutDuration = loadTimeoutFromConfig(confValue, "qemu_agent_timeout_seconds", 1*time.Second)
 
 	exporter, err := NewLibvirtExporter(*libvirtURI)
 	if err != nil {
@@ -1598,5 +1632,14 @@ func main() {
 			</body>
 			</html>`))
 	})
-	log.Fatal(http.ListenAndServe(*listenAddress, nil))
+	server := &http.Server{
+		Addr:              *listenAddress,
+		Handler:           nil,
+		ReadHeaderTimeout: webTimeoutDuration,
+		ReadTimeout:       webTimeoutDuration,
+		WriteTimeout:      webTimeoutDuration,
+		IdleTimeout:       webTimeoutDuration,
+	}
+
+	log.Fatal(server.ListenAndServe())
 }
