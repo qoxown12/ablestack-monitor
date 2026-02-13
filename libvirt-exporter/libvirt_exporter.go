@@ -85,6 +85,10 @@ var password = ""
 var webTimeoutDuration = 10 * time.Second
 var qemuAgentTimeoutDuration = 1 * time.Second
 var fsInfoIntervalDuration = 0 * time.Second
+var moldMetaIntervalDuration = 120 * time.Second
+var moldMetaLastRefresh time.Time
+var moldMetaLastStatus = 0.0
+var moldMetaMutex sync.RWMutex
 
 type fsInfoMetric struct {
 	partitionName       string
@@ -507,6 +511,7 @@ func CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error 
 	domain_mold_name := domainName
 	display_mold_name := domainName
 	vm_user_name := "N/A"
+	moldMetaMutex.RLock()
 	for _, val := range domainMetaInfo {
 		if domainName == val["domain_name"] {
 			domain_mold_name = val["domain_mold_name"]
@@ -514,6 +519,7 @@ func CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error 
 			vm_user_name = val["vm_user_name"]
 		}
 	}
+	moldMetaMutex.RUnlock()
 
 	ch <- prometheus.MustNewConstMetric(
 		libvirtDomainInfoMetaDesc,
@@ -639,6 +645,7 @@ func CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error 
 		mold_disk_name := "N/A"
 		display_volume_name := disk.Name
 		mold_volume_type := "N/A"
+		moldMetaMutex.RLock()
 		for _, val := range diskMetaInfo {
 			if domainName == val["domain_name"] && strings.Contains(strings.ReplaceAll(DiskSource, "-", ""), strings.ReplaceAll(val["disk_path"], "-", "")) {
 				mold_disk_name = val["mold_disk_name"]
@@ -646,6 +653,7 @@ func CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error 
 				mold_volume_type = val["volume_type"]
 			}
 		}
+		moldMetaMutex.RUnlock()
 		ch <- prometheus.MustNewConstMetric(
 			libvirtDomainMetaBlockDesc,
 			prometheus.GaugeValue,
@@ -943,11 +951,13 @@ func CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error 
 		if SourceBridge != "" || VirtualInterface != "" || MacAddress != "" {
 
 			mold_network_name := "N/A"
+			moldMetaMutex.RLock()
 			for _, val := range networkMetaInfo {
 				if MacAddress == val["mac_addr"] && val["mold_network_name"] != "%!s(<nil>)" {
 					mold_network_name = val["mold_network_name"]
 				}
 			}
+			moldMetaMutex.RUnlock()
 
 			ch <- prometheus.MustNewConstMetric(
 				libvirtDomainMetaInterfacesDesc,
@@ -1412,13 +1422,32 @@ func loadStringSetFromConfig(conf map[string]interface{}, key string) map[string
 }
 
 func CollectMoldMeta(ch chan<- prometheus.Metric) {
+	if moldMetaIntervalDuration > 0 {
+		moldMetaMutex.RLock()
+		useCache := !moldMetaLastRefresh.IsZero() && time.Since(moldMetaLastRefresh) < moldMetaIntervalDuration
+		cachedStatus := moldMetaLastStatus
+		moldMetaMutex.RUnlock()
+
+		if useCache {
+			ch <- prometheus.MustNewConstMetric(
+				libvirtMoldCollectDesc,
+				prometheus.GaugeValue,
+				cachedStatus)
+			return
+		}
+	}
+
 	moldDbConf := confValue["mold_db"].(map[string]interface{})
 	serverhost := moldDbConf["serverhost"].(string)
 	port := moldDbConf["port"].(string)
 	database := moldDbConf["database"].(string)
 	username := moldDbConf["username"].(string)
 	statusVal := 1.0
+	refreshAt := time.Now()
 	enpw := moldDbConf["password"].(string) // pw_encryption.go 파일로 암호화시킨 비밀번호
+	domainMetaInfoTemp := map[int]map[string]string{}
+	networkMetaInfoTemp := map[int]map[string]string{}
+	diskMetaInfoTemp := map[int]map[string]string{}
 
 	//키는 16, 24, 32만 가능합니다
 	var key = []byte("ablestackwallkey") // pw_encryption.go 에서 암호화 한 방식과 동일한 key
@@ -1432,6 +1461,7 @@ func CollectMoldMeta(ch chan<- prometheus.Metric) {
 	db, err := sql.Open("mysql", username+":"+password+"@tcp("+serverhost+":"+port+")/"+database)
 	if err != nil {
 		log.Println(err)
+		statusVal = 0.0
 	} else {
 		defer db.Close()
 
@@ -1476,7 +1506,7 @@ func CollectMoldMeta(ch chan<- prometheus.Metric) {
 					tmp_struct[col] = fmt.Sprintf("%s", v)
 				}
 
-				domainMetaInfo[result_id] = tmp_struct
+				domainMetaInfoTemp[result_id] = tmp_struct
 				result_id++
 			}
 
@@ -1528,7 +1558,7 @@ func CollectMoldMeta(ch chan<- prometheus.Metric) {
 					tmp_struct[col] = fmt.Sprintf("%s", v)
 				}
 
-				networkMetaInfo[result_id] = tmp_struct
+				networkMetaInfoTemp[result_id] = tmp_struct
 				result_id++
 			}
 
@@ -1581,7 +1611,7 @@ func CollectMoldMeta(ch chan<- prometheus.Metric) {
 					tmp_struct[col] = fmt.Sprintf("%s", v)
 				}
 
-				diskMetaInfo[result_id] = tmp_struct
+				diskMetaInfoTemp[result_id] = tmp_struct
 				result_id++
 			}
 
@@ -1589,6 +1619,16 @@ func CollectMoldMeta(ch chan<- prometheus.Metric) {
 			diskRows.Close()
 		}
 	}
+
+	moldMetaMutex.Lock()
+	if statusVal == 1.0 {
+		domainMetaInfo = domainMetaInfoTemp
+		networkMetaInfo = networkMetaInfoTemp
+		diskMetaInfo = diskMetaInfoTemp
+	}
+	moldMetaLastStatus = statusVal
+	moldMetaLastRefresh = refreshAt
+	moldMetaMutex.Unlock()
 
 	ch <- prometheus.MustNewConstMetric(
 		libvirtMoldCollectDesc,
@@ -1739,6 +1779,7 @@ func main() {
 	webTimeoutDuration = loadTimeoutFromConfig(confValue, "web_timeout_seconds", 10*time.Second)
 	qemuAgentTimeoutDuration = loadTimeoutFromConfig(confValue, "qemu_agent_timeout_seconds", 1*time.Second)
 	fsInfoIntervalDuration = loadDurationSecondsFromConfig(confValue, "fsinfo_interval_seconds", 0*time.Second)
+	moldMetaIntervalDuration = loadDurationSecondsFromConfig(confValue, "mold_meta_interval_seconds", 120*time.Second)
 	excludedDomainNames = loadStringSetFromConfig(confValue, "exclude_domain_names")
 
 	exporter, err := NewLibvirtExporter(*libvirtURI)
