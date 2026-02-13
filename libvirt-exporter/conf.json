@@ -2,6 +2,9 @@
     "web_timeout_seconds": 10,
     "qemu_agent_timeout_seconds": 1,
     "fsinfo_interval_seconds": 3600,
+    "enable_stats_perf": false,
+    "enable_stats_vcpu": false,
+    "enable_domain_block_io_tune": false,
     "mold_meta_interval_seconds": 120,
     "exclude_domain_names": [
         "ccvm",
