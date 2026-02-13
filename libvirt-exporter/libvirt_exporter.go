@@ -33,6 +33,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/AlexZzz/libvirt-exporter/libvirtSchema"
@@ -83,6 +84,25 @@ var excludedDomainNames = map[string]struct{}{}
 var password = ""
 var webTimeoutDuration = 10 * time.Second
 var qemuAgentTimeoutDuration = 1 * time.Second
+var fsInfoIntervalDuration = 0 * time.Second
+
+type fsInfoMetric struct {
+	partitionName       string
+	partitionMountpoint string
+	partitionType       string
+	serial              string
+	totalBytes          float64
+	usedBytes           float64
+}
+
+type fsInfoCacheEntry struct {
+	updatedAt time.Time
+	status    float64
+	metrics   []fsInfoMetric
+}
+
+var fsInfoCache = map[string]fsInfoCacheEntry{}
+var fsInfoCacheMutex sync.RWMutex
 
 type AESCipher struct {
 	block cipher.Block
@@ -1101,8 +1121,7 @@ func CollectFromLibvirt(ch chan<- prometheus.Metric, uri string) error {
 		libvirtdVersion,
 		libraryVersion)
 
-	domains, err := conn.ListAllDomains(
-		libvirt.CONNECT_LIST_DOMAINS_RUNNING | libvirt.CONNECT_LIST_DOMAINS_SHUTOFF)
+	domains, err := conn.ListAllDomains(libvirt.CONNECT_LIST_DOMAINS_RUNNING)
 	if err != nil {
 		return err
 	}
@@ -1329,6 +1348,33 @@ func loadTimeoutFromConfig(conf map[string]interface{}, key string, defaultTimeo
 	return defaultTimeout
 }
 
+func loadDurationSecondsFromConfig(conf map[string]interface{}, key string, defaultValue time.Duration) time.Duration {
+	raw, ok := conf[key]
+	if !ok {
+		return defaultValue
+	}
+
+	parseSeconds := func(sec int) time.Duration {
+		if sec < 0 {
+			return time.Duration(-1) * time.Second
+		}
+		return time.Duration(sec) * time.Second
+	}
+
+	switch v := raw.(type) {
+	case float64:
+		return parseSeconds(int(v))
+	case string:
+		sec, err := strconv.Atoi(strings.TrimSpace(v))
+		if err == nil {
+			return parseSeconds(sec)
+		}
+	}
+
+	log.Printf("invalid %s value in conf.json, using default %s", key, defaultValue)
+	return defaultValue
+}
+
 func loadStringSetFromConfig(conf map[string]interface{}, key string) map[string]struct{} {
 	result := make(map[string]struct{})
 
@@ -1550,108 +1596,114 @@ func CollectMoldMeta(ch chan<- prometheus.Metric) {
 		statusVal)
 }
 
-func checkFsinfo(domainName string, ch chan<- prometheus.Metric) {
+func emitFsInfoMetrics(domainName string, entry fsInfoCacheEntry, ch chan<- prometheus.Metric) {
+	for _, metric := range entry.metrics {
+		ch <- prometheus.MustNewConstMetric(
+			libvirtDomainFsInfoTotalBytesDesc,
+			prometheus.GaugeValue,
+			metric.totalBytes,
+			domainName,
+			metric.partitionName,
+			metric.partitionMountpoint,
+			metric.partitionType,
+			metric.serial)
+
+		ch <- prometheus.MustNewConstMetric(
+			libvirtDomainFsInfoUsageBytesDesc,
+			prometheus.GaugeValue,
+			metric.usedBytes,
+			domainName,
+			metric.partitionName,
+			metric.partitionMountpoint,
+			metric.partitionType,
+			metric.serial)
+	}
+
+	ch <- prometheus.MustNewConstMetric(
+		libvirtDomainFsInfoAgentStatusDesc,
+		prometheus.GaugeValue,
+		entry.status,
+		domainName)
+}
+
+func collectFsInfo(domainName string) fsInfoCacheEntry {
+	entry := fsInfoCacheEntry{
+		updatedAt: time.Now(),
+		status:    1, // command or parse error by default
+		metrics:   []fsInfoMetric{},
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), qemuAgentTimeoutDuration)
 	defer cancel()
 
-	// 실행할 셸 명령과 인자들
 	cmd := exec.CommandContext(ctx, "virsh", "qemu-agent-command", domainName, "{\"execute\": \"guest-get-fsinfo\"}", "--pretty")
 
-	// 명령 실행 및 결과 처리
 	jsonString, err := cmd.CombinedOutput()
 	if err != nil {
-		ch <- prometheus.MustNewConstMetric(
-			libvirtDomainFsInfoAgentStatusDesc,
-			prometheus.GaugeValue,
-			float64(1),
-			domainName)
-		// fmt.Println("에러 발생:", err)
-		return
+		return entry
 	}
 
-	jsonBytes := []byte(jsonString)
-	// JSON 디코딩하여 구조체에 저장
 	var data ReturnData
-	err = json.Unmarshal(jsonBytes, &data)
-	if err != nil {
-		// fmt.Println("JSON 파싱 오류:", err)
+	if err := json.Unmarshal(jsonString, &data); err != nil {
+		return entry
+	}
+
+	notSupportedAgent := true
+	for _, partition := range data.Return {
+		if len(partition.Disk) == 0 || partition.TotalBytes <= 0 {
+			continue
+		}
+
+		notSupportedAgent = false
+		serial := ""
+		for _, disk := range partition.Disk {
+			if len(disk.Serial) >= 20 {
+				serial = disk.Serial[len(disk.Serial)-20:]
+			} else {
+				serial = disk.Serial
+			}
+		}
+
+		entry.metrics = append(entry.metrics, fsInfoMetric{
+			partitionName:       partition.Name,
+			partitionMountpoint: partition.Mountpoint,
+			partitionType:       partition.Type,
+			serial:              serial,
+			totalBytes:          float64(partition.TotalBytes),
+			usedBytes:           float64(partition.UsedBytes),
+		})
+	}
+
+	if notSupportedAgent {
+		entry.status = 2
+	} else {
+		entry.status = 0
+	}
+	return entry
+}
+
+func checkFsinfo(domainName string, ch chan<- prometheus.Metric) {
+	if fsInfoIntervalDuration < 0 {
 		return
 	}
 
-	// 데이터 출력
-	var notSupportedAgnet bool = true
-	for _, partition := range data.Return {
-		// 디스크 정보가 null이면 제외
-		// 총 용량이 0이면 제외
-		if len(partition.Disk) != 0 {
-			var serial string = ""
-			// fmt.Println("-----------------------------------")
-			// fmt.Printf("가상머신 이름: %s\n", domainName)
-			// fmt.Printf("파티션 이름: %s\n", partition.Name)
-			// fmt.Printf("총 용량(bytes): %d\n", partition.TotalBytes)
-			// fmt.Printf("마운트 포인트: %s\n", partition.Mountpoint)
-			// fmt.Printf("사용 용량(bytes): %d\n", partition.UsedBytes)
-			// fmt.Printf("파티션 타입: %s\n", partition.Type)
-			// fmt.Println("디스크 정보:")
-
-			for _, disk := range partition.Disk {
-				// 마지막 16자리 단어 구하기 (시리얼 정보)
-				length := len(disk.Serial)
-				var last20 string
-				if length >= 20 {
-					last20 = disk.Serial[length-20:]
-				} else {
-					last20 = disk.Serial // 문자열이 16자리보다 짧을 경우 전체 문자열 반환
-				}
-				serial = last20
-				// serial = disk.Serial
-				// fmt.Printf("- 시리얼 번호: %s\n", disk.Serial)
-				// fmt.Printf("- 버스 타입: %s\n", disk.BusType)
-				// fmt.Printf("  버스: %d\n", disk.Bus)
-				// fmt.Printf("  PCI 컨트롤러: Bus %d, Slot %d, Domain %d, Function %d\n",
-				// 	disk.PCIController.Bus, disk.PCIController.Slot, disk.PCIController.Domain, disk.PCIController.Function)
-				// fmt.Printf("  장치 경로: %s\n", disk.Dev)
-				// fmt.Printf("  타겟: %d\n", disk.Target)
-			}
-
-			if partition.TotalBytes > 0 {
-				notSupportedAgnet = false
-				ch <- prometheus.MustNewConstMetric(
-					libvirtDomainFsInfoTotalBytesDesc,
-					prometheus.GaugeValue,
-					float64(partition.TotalBytes),
-					domainName,
-					partition.Name,
-					partition.Mountpoint,
-					partition.Type,
-					serial)
-
-				ch <- prometheus.MustNewConstMetric(
-					libvirtDomainFsInfoUsageBytesDesc,
-					prometheus.GaugeValue,
-					float64(partition.UsedBytes),
-					domainName,
-					partition.Name,
-					partition.Mountpoint,
-					partition.Type,
-					serial)
-			}
+	if fsInfoIntervalDuration > 0 {
+		fsInfoCacheMutex.RLock()
+		cached, ok := fsInfoCache[domainName]
+		fsInfoCacheMutex.RUnlock()
+		if ok && time.Since(cached.updatedAt) < fsInfoIntervalDuration {
+			emitFsInfoMetrics(domainName, cached, ch)
+			return
 		}
 	}
 
-	if notSupportedAgnet {
-		ch <- prometheus.MustNewConstMetric(
-			libvirtDomainFsInfoAgentStatusDesc,
-			prometheus.GaugeValue,
-			float64(2),
-			domainName)
-	} else {
-		ch <- prometheus.MustNewConstMetric(
-			libvirtDomainFsInfoAgentStatusDesc,
-			prometheus.GaugeValue,
-			float64(0),
-			domainName)
+	entry := collectFsInfo(domainName)
+	if fsInfoIntervalDuration > 0 {
+		fsInfoCacheMutex.Lock()
+		fsInfoCache[domainName] = entry
+		fsInfoCacheMutex.Unlock()
 	}
+	emitFsInfoMetrics(domainName, entry, ch)
 }
 
 func main() {
@@ -1686,6 +1738,7 @@ func main() {
 	}
 	webTimeoutDuration = loadTimeoutFromConfig(confValue, "web_timeout_seconds", 10*time.Second)
 	qemuAgentTimeoutDuration = loadTimeoutFromConfig(confValue, "qemu_agent_timeout_seconds", 1*time.Second)
+	fsInfoIntervalDuration = loadDurationSecondsFromConfig(confValue, "fsinfo_interval_seconds", 0*time.Second)
 	excludedDomainNames = loadStringSetFromConfig(confValue, "exclude_domain_names")
 
 	exporter, err := NewLibvirtExporter(*libvirtURI)
