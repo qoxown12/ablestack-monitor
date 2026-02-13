@@ -79,6 +79,7 @@ var byteValue []uint8
 var domainMetaInfo = map[int]map[string]string{}
 var networkMetaInfo = map[int]map[string]string{}
 var diskMetaInfo = map[int]map[string]string{}
+var excludedDomainNames = map[string]struct{}{}
 var password = ""
 var webTimeoutDuration = 10 * time.Second
 var qemuAgentTimeoutDuration = 1 * time.Second
@@ -1100,24 +1101,59 @@ func CollectFromLibvirt(ch chan<- prometheus.Metric, uri string) error {
 		libvirtdVersion,
 		libraryVersion)
 
-	stats, err := conn.GetAllDomainStats([]*libvirt.Domain{}, libvirt.DOMAIN_STATS_STATE|libvirt.DOMAIN_STATS_CPU_TOTAL|
-		libvirt.DOMAIN_STATS_INTERFACE|libvirt.DOMAIN_STATS_BALLOON|libvirt.DOMAIN_STATS_BLOCK|
-		libvirt.DOMAIN_STATS_PERF|libvirt.DOMAIN_STATS_VCPU,
-		//libvirt.CONNECT_GET_ALL_DOMAINS_STATS_NOWAIT, // maybe in future
-		libvirt.CONNECT_GET_ALL_DOMAINS_STATS_RUNNING|libvirt.CONNECT_GET_ALL_DOMAINS_STATS_SHUTOFF)
-	defer func(stats []libvirt.DomainStats) {
-		for _, stat := range stats {
-			stat.Domain.Free()
-		}
-	}(stats)
+	domains, err := conn.ListAllDomains(
+		libvirt.CONNECT_LIST_DOMAINS_RUNNING | libvirt.CONNECT_LIST_DOMAINS_SHUTOFF)
 	if err != nil {
 		return err
 	}
-	for _, stat := range stats {
-		err = CollectDomain(ch, stat)
-		if err != nil {
-			log.Printf("Failed to scrape metrics: %s", err)
+	defer func(domains []libvirt.Domain) {
+		for i := range domains {
+			domains[i].Free()
 		}
+	}(domains)
+
+	statsTypes := libvirt.DOMAIN_STATS_STATE | libvirt.DOMAIN_STATS_CPU_TOTAL |
+		libvirt.DOMAIN_STATS_INTERFACE | libvirt.DOMAIN_STATS_BALLOON | libvirt.DOMAIN_STATS_BLOCK |
+		libvirt.DOMAIN_STATS_PERF | libvirt.DOMAIN_STATS_VCPU
+
+	for i := range domains {
+		domainName, err := domains[i].GetName()
+		if err == nil {
+			excluded := false
+			for pattern := range excludedDomainNames {
+				if strings.HasPrefix(domainName, pattern) {
+					excluded = true
+					break
+				}
+			}
+			if excluded {
+				continue
+			}
+		}
+
+		stats, err := conn.GetAllDomainStats(
+			[]*libvirt.Domain{&domains[i]},
+			statsTypes,
+			libvirt.CONNECT_GET_ALL_DOMAINS_STATS_NOWAIT,
+		)
+		if err != nil {
+			log.Printf("Failed to get domain stats: %s", err)
+			continue
+		}
+
+		func(stats []libvirt.DomainStats) {
+			defer func(stats []libvirt.DomainStats) {
+				for _, stat := range stats {
+					stat.Domain.Free()
+				}
+			}(stats)
+
+			for _, stat := range stats {
+				if err := CollectDomain(ch, stat); err != nil {
+					log.Printf("Failed to scrape metrics: %s", err)
+				}
+			}
+		}(stats)
 	}
 	return nil
 }
@@ -1291,6 +1327,42 @@ func loadTimeoutFromConfig(conf map[string]interface{}, key string, defaultTimeo
 
 	log.Printf("invalid %s value in conf.json, using default %s", key, defaultTimeout)
 	return defaultTimeout
+}
+
+func loadStringSetFromConfig(conf map[string]interface{}, key string) map[string]struct{} {
+	result := make(map[string]struct{})
+
+	raw, ok := conf[key]
+	if !ok {
+		return result
+	}
+
+	switch v := raw.(type) {
+	case []interface{}:
+		for _, item := range v {
+			name, ok := item.(string)
+			if !ok {
+				continue
+			}
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+			result[name] = struct{}{}
+		}
+	case string:
+		for _, item := range strings.Split(v, ",") {
+			name := strings.TrimSpace(item)
+			if name == "" {
+				continue
+			}
+			result[name] = struct{}{}
+		}
+	default:
+		log.Printf("invalid %s value in conf.json, expected array or comma-separated string", key)
+	}
+
+	return result
 }
 
 func CollectMoldMeta(ch chan<- prometheus.Metric) {
@@ -1614,6 +1686,7 @@ func main() {
 	}
 	webTimeoutDuration = loadTimeoutFromConfig(confValue, "web_timeout_seconds", 10*time.Second)
 	qemuAgentTimeoutDuration = loadTimeoutFromConfig(confValue, "qemu_agent_timeout_seconds", 1*time.Second)
+	excludedDomainNames = loadStringSetFromConfig(confValue, "exclude_domain_names")
 
 	exporter, err := NewLibvirtExporter(*libvirtURI)
 	if err != nil {

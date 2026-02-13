@@ -1,6 +1,13 @@
 {
     "web_timeout_seconds": 10,
     "qemu_agent_timeout_seconds": 1,
+    "exclude_domain_names": [
+        "ccvm",
+        "scvm",
+        "r-",
+        "s-",
+        "v-"
+    ],
     "mold_db": {
         "serverhost":"ccvm",
         "port":"3306",
