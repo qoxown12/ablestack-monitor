@@ -88,6 +88,7 @@ var fsInfoIntervalDuration = 0 * time.Second
 var enableStatsPerf = false
 var enableStatsVcpu = false
 var enableDomainBlockIoTune = false
+var moldDbConnectTimeoutDuration = 3 * time.Second
 var moldMetaIntervalDuration = 120 * time.Second
 var moldMetaLastRefresh time.Time
 var moldMetaLastStatus = 0.0
@@ -1491,7 +1492,9 @@ func CollectMoldMeta(ch chan<- prometheus.Metric) {
 	}
 
 	// sql.DB 객체 생성
-	db, err := sql.Open("mysql", username+":"+password+"@tcp("+serverhost+":"+port+")/"+database)
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?timeout=%s",
+		username, password, serverhost, port, database, moldDbConnectTimeoutDuration)
+	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		log.Println(err)
 		statusVal = 0.0
@@ -1815,6 +1818,7 @@ func main() {
 	enableStatsPerf = loadBoolFromConfig(confValue, "enable_stats_perf", false)
 	enableStatsVcpu = loadBoolFromConfig(confValue, "enable_stats_vcpu", false)
 	enableDomainBlockIoTune = loadBoolFromConfig(confValue, "enable_domain_block_io_tune", false)
+	moldDbConnectTimeoutDuration = loadTimeoutFromConfig(confValue, "mold_db_connect_timeout_seconds", 3*time.Second)
 	moldMetaIntervalDuration = loadDurationSecondsFromConfig(confValue, "mold_meta_interval_seconds", 120*time.Second)
 	excludedDomainNames = loadStringSetFromConfig(confValue, "exclude_domain_names")
 
