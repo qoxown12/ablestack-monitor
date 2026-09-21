@@ -18,6 +18,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -26,6 +27,7 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -40,6 +42,8 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
 	"gopkg.in/alecthomas/kingpin.v2"
 	"libvirt.org/go/libvirt"
 )
@@ -86,6 +90,7 @@ var webTimeoutDuration = 10 * time.Second
 var qemuAgentTimeoutDuration = 1 * time.Second
 var domStatsTimeoutDuration = 2 * time.Second
 var fsInfoIntervalDuration = 0 * time.Second
+var jobCooldownDuration = 60 * time.Second
 var enableStatsPerf = false
 var enableStatsVcpu = false
 var enableDomainBlockIoTune = false
@@ -94,6 +99,7 @@ var moldMetaIntervalDuration = 120 * time.Second
 var moldMetaLastRefresh time.Time
 var moldMetaLastStatus = 0.0
 var moldMetaMutex sync.RWMutex
+var runtimeConfPath = "./conf.json"
 
 type fsInfoMetric struct {
 	partitionName       string
@@ -113,9 +119,33 @@ type fsInfoCacheEntry struct {
 var fsInfoCache = map[string]fsInfoCacheEntry{}
 var fsInfoCacheMutex sync.RWMutex
 
-type domainStatsResult struct {
-	stats []libvirt.DomainStats
-	err   error
+type domainJobState struct {
+	active        bool
+	cooldownUntil time.Time
+}
+
+var domainJobStates = map[string]domainJobState{}
+var domainJobStatesMutex sync.Mutex
+var domainCollectionInFlight = map[string]bool{}
+var domainCollectionInFlightMutex sync.Mutex
+var qgaInFlight = map[string]bool{}
+var qgaInFlightMutex sync.Mutex
+
+type domainWorkerInput struct {
+	DomainMetaInfo  map[int]map[string]string `json:"domain_meta_info"`
+	NetworkMetaInfo map[int]map[string]string `json:"network_meta_info"`
+	DiskMetaInfo    map[int]map[string]string `json:"disk_meta_info"`
+}
+
+type domainWorkerCollector struct {
+	uri        string
+	domainName string
+	err        error
+}
+
+type importedMetric struct {
+	desc   *prometheus.Desc
+	metric *dto.Metric
 }
 
 type AESCipher struct {
@@ -275,6 +305,16 @@ var (
 		prometheus.BuildFQName("libvirt", "domain_fs_info", "usage_bytes"),
 		"Total disk usage of virtual machine mount path",
 		[]string{"domain", "partition_name", "partition_mountpoint", "partition_type", "serial"},
+		nil)
+	libvirtDomainCollectionSkippedDesc = prometheus.NewDesc(
+		prometheus.BuildFQName("libvirt", "domain_collection", "skipped"),
+		"Whether collection for a domain was skipped for a protective reason.",
+		[]string{"domain", "reason"},
+		nil)
+	libvirtDomainQGASuppressedDesc = prometheus.NewDesc(
+		prometheus.BuildFQName("libvirt", "domain_qga", "suppressed"),
+		"Whether QEMU guest agent collection was suppressed for a protective reason.",
+		[]string{"domain", "reason"},
 		nil)
 
 	// Block IO tune parameters
@@ -946,8 +986,6 @@ func CollectDomain(ch chan<- prometheus.Metric, stat libvirt.DomainStats) error 
 		}
 	}
 
-	checkFsinfo(domainName, ch)
-
 	// Report network interface statistics.
 	for _, iface := range stat.Net {
 		var SourceBridge string
@@ -1156,13 +1194,6 @@ func CollectFromLibvirt(ch chan<- prometheus.Metric, uri string) error {
 		}
 	}(domains)
 
-	statsTypes := libvirt.DOMAIN_STATS_STATE | libvirt.DOMAIN_STATS_CPU_TOTAL |
-		libvirt.DOMAIN_STATS_INTERFACE | libvirt.DOMAIN_STATS_BALLOON |
-		libvirt.DOMAIN_STATS_BLOCK | libvirt.DOMAIN_STATS_VCPU | libvirt.DOMAIN_STATS_MEMORY
-	if enableStatsPerf {
-		statsTypes |= libvirt.DOMAIN_STATS_PERF
-	}
-
 	for i := range domains {
 		domainName, err := domains[i].GetName()
 		if err == nil {
@@ -1183,88 +1214,276 @@ func CollectFromLibvirt(ch chan<- prometheus.Metric, uri string) error {
 			continue
 		}
 
-		stats, err := getDomainStatsWithTimeout(uri, domainName, statsTypes)
+		collectable, err := domainJobTypeIsNone(uri, domainName)
 		if err != nil {
-			log.Printf("Failed to get domain stats: %s", err)
+			emitDomainCollectionSkipped(ch, domainName, jobCheckFailureReason(err))
+			log.Printf("Failed to check domain job: %s", err)
+			continue
+		}
+		cooldownActive := observeDomainJobState(domainName, !collectable)
+		if !collectable {
+			emitDomainCollectionSkipped(ch, domainName, "active_job")
 			continue
 		}
 
-		func(stats []libvirt.DomainStats) {
-			defer func(stats []libvirt.DomainStats) {
-				for _, stat := range stats {
-					stat.Domain.Free()
-				}
-			}(stats)
-
-			for _, stat := range stats {
-				if err := CollectDomain(ch, stat); err != nil {
-					log.Printf("Failed to scrape metrics: %s", err)
-				}
+		if !acquireDomainCollection(domainName) {
+			emitDomainCollectionSkipped(ch, domainName, "collection_in_flight")
+			continue
+		}
+		metrics, err := getDomainStatsWithTimeout(uri, domainName)
+		releaseDomainCollection(domainName)
+		if err != nil {
+			reason := "collection_error"
+			if err == context.DeadlineExceeded {
+				reason = "collection_timeout"
 			}
-		}(stats)
+			emitDomainCollectionSkipped(ch, domainName, reason)
+			log.Printf("Failed to get domain stats for %s: %s", domainName, err)
+			continue
+		}
+		for _, metric := range metrics {
+			ch <- metric
+		}
+		checkFsinfo(uri, domainName, cooldownActive, ch)
 	}
 	return nil
 }
 
-func getDomainStatsWithTimeout(
-	uri string,
-	domainName string,
-	statsTypes libvirt.DomainStatsTypes,
-) ([]libvirt.DomainStats, error) {
-	collectable, err := domainJobTypeIsNone(uri, domainName)
+// Run per-domain libvirt calls in a disposable process so a stuck C call can be killed.
+func getDomainStatsWithTimeout(uri string, domainName string) ([]prometheus.Metric, error) {
+	workerInput := domainWorkerInput{}
+	moldMetaMutex.RLock()
+	workerInput.DomainMetaInfo = domainMetaInfo
+	workerInput.NetworkMetaInfo = networkMetaInfo
+	workerInput.DiskMetaInfo = diskMetaInfo
+	input, err := json.Marshal(workerInput)
+	moldMetaMutex.RUnlock()
 	if err != nil {
 		return nil, err
 	}
-	if !collectable {
-		return []libvirt.DomainStats{}, nil
+
+	executable, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), domStatsTimeoutDuration)
+	defer cancel()
+
+	cmd := exec.CommandContext(
+		ctx,
+		executable,
+		"--conf.path", runtimeConfPath,
+		"--libvirt.uri", uri,
+		"--internal.collect-domain", domainName,
+	)
+	cmd.Stdin = bytes.NewReader(input)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	output, err := cmd.Output()
+	if ctx.Err() == context.DeadlineExceeded {
+		return nil, context.DeadlineExceeded
+	}
+	if err != nil {
+		errText := strings.TrimSpace(stderr.String())
+		if errText != "" {
+			return nil, fmt.Errorf("domain worker failed: %s", errText)
+		}
+		return nil, err
 	}
 
-	resultCh := make(chan domainStatsResult, 1)
-
-	go func() {
-		domainConn, err := libvirt.NewConnectReadOnly(uri)
-		if err != nil {
-			resultCh <- domainStatsResult{err: err}
-			return
+	decoder := expfmt.NewDecoder(bytes.NewReader(output), expfmt.FmtProtoDelim)
+	metrics := []prometheus.Metric{}
+	for {
+		var family dto.MetricFamily
+		if err := decoder.Decode(&family); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, fmt.Errorf("failed to decode domain worker metrics: %s", err)
 		}
-		defer domainConn.Close()
-
-		domain, err := domainConn.LookupDomainByName(domainName)
-		if err != nil {
-			resultCh <- domainStatsResult{err: err}
-			return
+		for _, metric := range family.Metric {
+			labelNames := make([]string, len(metric.Label))
+			for i, label := range metric.Label {
+				labelNames[i] = label.GetName()
+			}
+			metrics = append(metrics, &importedMetric{
+				desc:   prometheus.NewDesc(family.GetName(), family.GetHelp(), labelNames, nil),
+				metric: metric,
+			})
 		}
-		defer domain.Free()
+	}
+	return metrics, nil
+}
 
-		stats, err := domainConn.GetAllDomainStats(
-			[]*libvirt.Domain{domain},
-			statsTypes,
-			libvirt.CONNECT_GET_ALL_DOMAINS_STATS_NOWAIT,
-		)
-		resultCh <- domainStatsResult{
-			stats: stats,
-			err:   err,
+func (m *importedMetric) Desc() *prometheus.Desc {
+	return m.desc
+}
+
+func (m *importedMetric) Write(out *dto.Metric) error {
+	*out = *m.metric
+	return nil
+}
+
+func (c *domainWorkerCollector) Describe(ch chan<- *prometheus.Desc) {
+}
+
+func (c *domainWorkerCollector) Collect(ch chan<- prometheus.Metric) {
+	conn, err := libvirt.NewConnectReadOnly(c.uri)
+	if err != nil {
+		c.err = err
+		return
+	}
+	defer conn.Close()
+
+	domain, err := conn.LookupDomainByName(c.domainName)
+	if err != nil {
+		c.err = err
+		return
+	}
+	defer domain.Free()
+
+	statsTypes := libvirt.DOMAIN_STATS_STATE | libvirt.DOMAIN_STATS_CPU_TOTAL |
+		libvirt.DOMAIN_STATS_INTERFACE | libvirt.DOMAIN_STATS_BALLOON |
+		libvirt.DOMAIN_STATS_BLOCK | libvirt.DOMAIN_STATS_VCPU | libvirt.DOMAIN_STATS_MEMORY
+	if enableStatsPerf {
+		statsTypes |= libvirt.DOMAIN_STATS_PERF
+	}
+	stats, err := conn.GetAllDomainStats(
+		[]*libvirt.Domain{domain},
+		statsTypes,
+		libvirt.CONNECT_GET_ALL_DOMAINS_STATS_NOWAIT,
+	)
+	if err != nil {
+		c.err = err
+		return
+	}
+	defer func() {
+		for _, stat := range stats {
+			stat.Domain.Free()
 		}
 	}()
 
-	timer := time.NewTimer(domStatsTimeoutDuration)
-	defer timer.Stop()
-
-	select {
-	case result := <-resultCh:
-		return result.stats, result.err
-	case <-timer.C:
-		return nil, fmt.Errorf("timed out after %s for domain %s", domStatsTimeoutDuration, domainName)
+	for _, stat := range stats {
+		if err := CollectDomain(ch, stat); err != nil {
+			c.err = err
+			return
+		}
 	}
+}
+
+// runDomainWorker gathers one domain and streams protobuf metrics to its parent.
+func runDomainWorker(uri string, domainName string) error {
+	var input domainWorkerInput
+	if err := json.NewDecoder(os.Stdin).Decode(&input); err != nil {
+		return fmt.Errorf("failed to decode domain worker input: %s", err)
+	}
+	domainMetaInfo = input.DomainMetaInfo
+	networkMetaInfo = input.NetworkMetaInfo
+	diskMetaInfo = input.DiskMetaInfo
+
+	collector := &domainWorkerCollector{uri: uri, domainName: domainName}
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(collector)
+	families, err := registry.Gather()
+	if err != nil {
+		return err
+	}
+	if collector.err != nil {
+		return collector.err
+	}
+
+	encoder := expfmt.NewEncoder(os.Stdout, expfmt.FmtProtoDelim)
+	for _, family := range families {
+		if err := encoder.Encode(family); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func emitDomainCollectionSkipped(ch chan<- prometheus.Metric, domainName string, reason string) {
+	ch <- prometheus.MustNewConstMetric(
+		libvirtDomainCollectionSkippedDesc,
+		prometheus.GaugeValue,
+		1,
+		domainName,
+		reason)
+}
+
+func emitQGASuppressed(ch chan<- prometheus.Metric, domainName string, reason string) {
+	ch <- prometheus.MustNewConstMetric(
+		libvirtDomainQGASuppressedDesc,
+		prometheus.GaugeValue,
+		1,
+		domainName,
+		reason)
+}
+
+func observeDomainJobState(domainName string, active bool) bool {
+	domainJobStatesMutex.Lock()
+	defer domainJobStatesMutex.Unlock()
+
+	state := domainJobStates[domainName]
+	now := time.Now()
+	if active {
+		state.active = true
+		state.cooldownUntil = time.Time{}
+	} else if state.active {
+		state.active = false
+		state.cooldownUntil = now.Add(jobCooldownDuration)
+	}
+	domainJobStates[domainName] = state
+	return !state.cooldownUntil.IsZero() && now.Before(state.cooldownUntil)
+}
+
+func acquireDomainCollection(domainName string) bool {
+	domainCollectionInFlightMutex.Lock()
+	defer domainCollectionInFlightMutex.Unlock()
+	if domainCollectionInFlight[domainName] {
+		return false
+	}
+	domainCollectionInFlight[domainName] = true
+	return true
+}
+
+func releaseDomainCollection(domainName string) {
+	domainCollectionInFlightMutex.Lock()
+	delete(domainCollectionInFlight, domainName)
+	domainCollectionInFlightMutex.Unlock()
+}
+
+func acquireQGA(domainName string) bool {
+	qgaInFlightMutex.Lock()
+	defer qgaInFlightMutex.Unlock()
+	if qgaInFlight[domainName] {
+		return false
+	}
+	qgaInFlight[domainName] = true
+	return true
+}
+
+func releaseQGA(domainName string) {
+	qgaInFlightMutex.Lock()
+	delete(qgaInFlight, domainName)
+	qgaInFlightMutex.Unlock()
+}
+
+func jobCheckFailureReason(err error) string {
+	if err == context.DeadlineExceeded {
+		return "job_check_timeout"
+	}
+	return "job_check_error"
 }
 
 func domainJobTypeIsNone(uri string, domainName string) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), domStatsTimeoutDuration)
 	defer cancel()
 
-	output, err := exec.CommandContext(ctx, "virsh", "--connect", uri, "domjobinfo", domainName).CombinedOutput()
+	cmd := exec.CommandContext(ctx, "virsh", "--connect", uri, "domjobinfo", domainName)
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	output, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
-		return false, fmt.Errorf("timed out after %s checking domjobinfo for domain %s", domStatsTimeoutDuration, domainName)
+		return false, context.DeadlineExceeded
 	}
 	if err != nil {
 		errText := strings.TrimSpace(string(output))
@@ -1363,6 +1582,8 @@ func (e *LibvirtExporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- libvirtDomainFsInfoAgentStatusDesc
 	ch <- libvirtDomainFsInfoTotalBytesDesc
 	ch <- libvirtDomainFsInfoUsageBytesDesc
+	ch <- libvirtDomainCollectionSkippedDesc
+	ch <- libvirtDomainQGASuppressedDesc
 
 	// Domain net interfaces stats
 	ch <- libvirtDomainMetaInterfacesDesc
@@ -1789,7 +2010,7 @@ func emitFsInfoMetrics(domainName string, entry fsInfoCacheEntry, ch chan<- prom
 		domainName)
 }
 
-func collectFsInfo(domainName string) fsInfoCacheEntry {
+func collectFsInfo(uri string, domainName string) fsInfoCacheEntry {
 	entry := fsInfoCacheEntry{
 		updatedAt: time.Now(),
 		status:    1, // command or parse error by default
@@ -1799,7 +2020,7 @@ func collectFsInfo(domainName string) fsInfoCacheEntry {
 	ctx, cancel := context.WithTimeout(context.Background(), qemuAgentTimeoutDuration)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "virsh", "qemu-agent-command", domainName, "{\"execute\": \"guest-get-fsinfo\"}", "--pretty")
+	cmd := exec.CommandContext(ctx, "virsh", "--connect", uri, "qemu-agent-command", domainName, "{\"execute\": \"guest-get-fsinfo\"}", "--pretty")
 
 	jsonString, err := cmd.CombinedOutput()
 	if err != nil {
@@ -1845,7 +2066,7 @@ func collectFsInfo(domainName string) fsInfoCacheEntry {
 	return entry
 }
 
-func checkFsinfo(domainName string, ch chan<- prometheus.Metric) {
+func checkFsinfo(uri string, domainName string, cooldownActive bool, ch chan<- prometheus.Metric) {
 	if fsInfoIntervalDuration < 0 {
 		return
 	}
@@ -1860,7 +2081,32 @@ func checkFsinfo(domainName string, ch chan<- prometheus.Metric) {
 		}
 	}
 
-	entry := collectFsInfo(domainName)
+	if cooldownActive {
+		emitQGASuppressed(ch, domainName, "cooldown")
+		return
+	}
+	if !acquireQGA(domainName) {
+		emitQGASuppressed(ch, domainName, "qga_in_flight")
+		return
+	}
+	defer releaseQGA(domainName)
+
+	collectable, err := domainJobTypeIsNone(uri, domainName)
+	if err != nil {
+		emitQGASuppressed(ch, domainName, jobCheckFailureReason(err))
+		return
+	}
+	if !collectable {
+		observeDomainJobState(domainName, true)
+		emitQGASuppressed(ch, domainName, "active_job")
+		return
+	}
+	if observeDomainJobState(domainName, false) {
+		emitQGASuppressed(ch, domainName, "cooldown")
+		return
+	}
+
+	entry := collectFsInfo(uri, domainName)
 	if fsInfoIntervalDuration > 0 {
 		fsInfoCacheMutex.Lock()
 		fsInfoCache[domainName] = entry
@@ -1876,11 +2122,13 @@ func main() {
 		listenAddress = app.Flag("web.listen-address", "Address to listen on for web interface and telemetry.").Default(":3002").String()
 		metricsPath   = app.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
 		libvirtURI    = app.Flag("libvirt.uri", "Libvirt URI from which to extract metrics.").Default("qemu:///system").String()
+		workerDomain  = app.Flag("internal.collect-domain", "Collect one domain in an isolated worker process.").Hidden().String()
 	)
 
 	kingpin.MustParse(app.Parse(os.Args[1:]))
 
 	errorsMap = make(map[string]struct{})
+	runtimeConfPath = *confPath
 
 	// Open config json file
 	jsonFile, err := os.Open(*confPath)
@@ -1903,12 +2151,20 @@ func main() {
 	qemuAgentTimeoutDuration = loadTimeoutFromConfig(confValue, "qemu_agent_timeout_seconds", 1*time.Second)
 	domStatsTimeoutDuration = loadTimeoutFromConfig(confValue, "domstats_timeout_seconds", 2*time.Second)
 	fsInfoIntervalDuration = loadDurationSecondsFromConfig(confValue, "fsinfo_interval_seconds", 0*time.Second)
+	jobCooldownDuration = loadDurationSecondsFromConfig(confValue, "job_cooldown_seconds", 60*time.Second)
 	enableStatsPerf = loadBoolFromConfig(confValue, "enable_stats_perf", false)
 	enableStatsVcpu = loadBoolFromConfig(confValue, "enable_stats_vcpu", false)
 	enableDomainBlockIoTune = loadBoolFromConfig(confValue, "enable_domain_block_io_tune", false)
 	moldDbConnectTimeoutDuration = loadTimeoutFromConfig(confValue, "mold_db_connect_timeout_seconds", 3*time.Second)
 	moldMetaIntervalDuration = loadDurationSecondsFromConfig(confValue, "mold_meta_interval_seconds", 120*time.Second)
 	excludedDomainNames = loadStringSetFromConfig(confValue, "exclude_domain_names")
+	if *workerDomain != "" {
+		if err := runDomainWorker(*libvirtURI, *workerDomain); err != nil {
+			log.Printf("domain worker failed: %s", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	exporter, err := NewLibvirtExporter(*libvirtURI)
 	if err != nil {
